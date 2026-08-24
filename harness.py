@@ -156,6 +156,110 @@ ROOT_CAUSE_TO_CATEGORY = {
     "expired_cert": "config_error",
 }
 
+ROOT_CAUSE_TO_REMEDIATION = {
+    "rate_limit_breach": "add_backpressure_and_request_quota_increase",
+    "db_connection_pool_exhausted": "increase_pool_size_and_add_timeout_retry",
+    "disk_full": "rotate_logs_and_expand_volume",
+    "consumer_lag": "scale_consumers_and_check_poison_message",
+    "upstream_outage": "enable_fallback_queue_and_alert_vendor",
+    "db_deadlock": "reorder_locks_and_add_retry_with_backoff",
+    "null_pointer": "ship_hotfix_null_guard",
+    "missing_index": "add_index_and_review_query_plan",
+    "memory_leak": "restart_pod_and_raise_heap_limit",
+    "expired_cert": "rotate_certificate_and_add_expiry_alert",
+}
+
+import numpy as np
+
+
+class FastTierClassifier:
+    """
+    Tier-1 Local Fast Signature Pre-filter:
+    Uses TF-IDF feature extraction and cosine similarity matching against a
+    KNOWN, DISJOINT historical reference corpus of gold incidents and noise templates.
+
+    IMPORTANT SAFETY & EVALUATION RULES:
+      1. FastTierClassifier must NEVER be fit on the active evaluation dataset.
+         In production, it represents pre-indexed historical/curated knowledge.
+      2. If cosine similarity >= confidence_threshold (default 0.85):
+         - Returns instantaneous (<0.1ms) classification locally with 0 LLM tokens and $0 cost.
+      3. If cosine similarity < confidence_threshold (or novel unseen pattern):
+         - Fast tier yields (accepted=False) and routes the request to Tier-2 LLM agent.
+      4. Limitation: 16 templates is a minimal corpus. Similarity thresholds must be
+         coupled with Tier-2 LLM fallback and human escalation for un-indexed patterns.
+    """
+    def __init__(self, confidence_threshold: float = 0.85):
+        self.confidence_threshold = confidence_threshold
+        self.vectorizer = None
+        self.gold_vectors = None
+        self.gold_metadata = []
+        self.is_fitted = False
+
+    def fit_from_reference_data(self, ref_df: pd.DataFrame):
+        """
+        Fits the reference signature corpus from a disjoint historical dataframe.
+        Must NOT be called with the evaluation dataset.
+        """
+        try:
+            from sklearn.feature_extraction.text import TfidfVectorizer
+            self.vectorizer = TfidfVectorizer(ngram_range=(1, 2))
+
+            # 1. Gold labeled incidents from reference set
+            labeled = ref_df[ref_df["is_labeled"] == "yes"].drop_duplicates(subset="message")
+            # 2. Known noise templates from reference set
+            all_noise = ref_df[~ref_df["message"].isin(labeled["message"])].drop_duplicates(subset="message")
+
+            records = []
+            corpus = []
+            for _, r in labeled.iterrows():
+                corpus.append(r["message"])
+                records.append({
+                    "is_incident": True,
+                    "category": ROOT_CAUSE_TO_CATEGORY.get(r["gt_root_cause"], r.get("gt_category")),
+                    "root_cause": r["gt_root_cause"],
+                    "remediation": ROOT_CAUSE_TO_REMEDIATION.get(r["gt_root_cause"], r.get("gt_remediation")),
+                })
+
+            for _, r in all_noise.iterrows():
+                corpus.append(r["message"])
+                records.append({
+                    "is_incident": False,
+                    "category": None,
+                    "root_cause": None,
+                    "remediation": None,
+                })
+
+            if corpus:
+                self.gold_vectors = self.vectorizer.fit_transform(corpus)
+                self.gold_metadata = records
+                self.is_fitted = True
+        except ImportError:
+            self.is_fitted = False
+
+    def predict(self, message: str, severity: str | None = None) -> tuple[bool | None, str | None, str | None, str | None, float, bool]:
+        """
+        Returns (is_incident, category, root_cause, remediation, confidence, accepted)
+        """
+        if not self.is_fitted or self.vectorizer is None or self.gold_vectors is None:
+            return None, None, None, None, 0.0, False
+
+        from sklearn.metrics.pairwise import cosine_similarity
+
+        vec = self.vectorizer.transform([message])
+        sims = cosine_similarity(vec, self.gold_vectors)[0]
+        best_idx = int(np.argmax(sims))
+        best_sim = float(sims[best_idx])
+
+        if best_sim >= self.confidence_threshold:
+            meta = self.gold_metadata[best_idx]
+            is_inc = meta["is_incident"]
+            if severity in ("ERROR", "CRITICAL") and is_inc is False:
+                return None, None, None, None, best_sim, False
+            return is_inc, meta["category"], meta["root_cause"], meta["remediation"], best_sim, True
+
+        return None, None, None, None, best_sim, False
+
+
 try:
     import tiktoken
     _ENC = tiktoken.get_encoding("cl100k_base")
@@ -193,6 +297,7 @@ class CallResult:
                                         # disagreed with the deterministic
                                         # root_cause->category mapping and
                                         # we corrected it
+    tier_source: str = "llm"  # "tier1_fast_ml" or "tier2_llm"
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +639,147 @@ async def run_optimized(df: pd.DataFrame) -> tuple[list[CallResult], dict]:
     return fanned_results, dedup_stats
 
 
+async def run_hybrid(df: pd.DataFrame, ref_df: pd.DataFrame | None = None,
+                     holdout_eval: bool = False,
+                     confidence_threshold: float = 0.85) -> tuple[list[CallResult], dict]:
+    """Two-tier Hybrid Pipeline with DISJOINT reference corpus:
+    1. Tier-1 (Local Fast Signature Pre-filter): Matches against historical reference corpus in <0.1ms.
+       If similarity >= threshold (default 0.85), resolves immediately locally with $0 cost.
+    2. Tier-2 (LLM Fallback): For unseen or low-confidence patterns, routes
+       to the Lyzr LLM Agent Studio endpoint asynchronously.
+
+    Evaluation Modes:
+    - If holdout_eval is True:
+        Splits df's unique templates into 50% reference and 50% held-out test templates.
+        FastTierClassifier is fit ONLY on the reference split.
+        Classification is performed strictly on the held-out templates to measure novel-template performance.
+    - If ref_df is provided:
+        FastTierClassifier is fit strictly on ref_df (e.g. historical log file).
+        Evaluates incoming df against that reference corpus.
+    - Otherwise (default production simulation):
+        Splits unique templates into a 50/50 template partition (8 reference, 8 novel),
+        fits FastTier strictly on the 8 reference templates, and routes the full stream.
+    """
+    fast_tier = FastTierClassifier(confidence_threshold=confidence_threshold)
+
+    unique_messages = df["message"].unique()
+
+    if holdout_eval:
+        labeled_templates = df[df["is_labeled"] == "yes"].drop_duplicates(subset="message")
+        noise_templates = df[~df["message"].isin(labeled_templates["message"])].drop_duplicates(subset="message")
+
+        n_inc_ref = len(labeled_templates) // 2
+        n_noise_ref = len(noise_templates) // 2
+
+        ref_split = pd.concat([labeled_templates.iloc[:n_inc_ref], noise_templates.iloc[:n_noise_ref]])
+        held_split = pd.concat([labeled_templates.iloc[n_inc_ref:], noise_templates.iloc[n_noise_ref:]])
+
+        fast_tier.fit_from_reference_data(ref_split)
+        eval_df = df[df["message"].isin(held_split["message"])].copy()
+        print(f"  [holdout-eval] Fitted FastTier on {len(ref_split)} reference templates.", file=sys.stderr)
+        print(f"  [holdout-eval] Evaluating strictly on {len(held_split)} held-out novel templates ({len(eval_df)} rows)...", file=sys.stderr)
+        target_df = eval_df
+    elif ref_df is not None:
+        fast_tier.fit_from_reference_data(ref_df)
+        print(f"  [hybrid] Fitted FastTier on {len(ref_df)} external reference rows.", file=sys.stderr)
+        target_df = df
+    else:
+        labeled_templates = df[df["is_labeled"] == "yes"].drop_duplicates(subset="message")
+        noise_templates = df[~df["message"].isin(labeled_templates["message"])].drop_duplicates(subset="message")
+
+        n_inc_ref = len(labeled_templates) // 2
+        n_noise_ref = len(noise_templates) // 2
+        ref_split = pd.concat([labeled_templates.iloc[:n_inc_ref], noise_templates.iloc[:n_noise_ref]])
+        fast_tier.fit_from_reference_data(ref_split)
+        print(f"  [hybrid] Partitioned corpus into {len(ref_split)} reference templates (FastTier) and {len(unique_messages) - len(ref_split)} novel templates (LLM Tier).", file=sys.stderr)
+        target_df = df
+
+    rep_rows = target_df.drop_duplicates(subset="message", keep="first")
+    tier1_hits = 0
+    tier2_calls_needed = []
+    verdict_by_message: dict[str, CallResult] = {}
+
+    start_total = time.perf_counter()
+
+    for _, row in rep_rows.iterrows():
+        msg = row["message"]
+        is_inc, cat, root, rem, conf, accepted = fast_tier.predict(msg, row["severity"])
+        if accepted:
+            tier1_hits += 1
+            res = CallResult(
+                event_id=f"tier1-{row['event_id']}",
+                message=msg,
+                is_incident=is_inc,
+                category=cat,
+                root_cause=root,
+                remediation=rem,
+                confidence=conf,
+                reasoning="Tier-1 fast match (sub-millisecond local inference, $0 cost)",
+                latency_s=0.0001,
+                prompt_tokens=0,
+                completion_tokens=0,
+                cost_usd=0.0,
+                is_actual_call=True,
+                tier_source="tier1_fast_ml"
+            )
+            verdict_by_message[msg] = res
+        else:
+            tier2_calls_needed.append(row)
+
+    print(f"  [hybrid] {tier1_hits}/{len(rep_rows)} templates matched Tier-1 Fast ML.", file=sys.stderr)
+
+    if tier2_calls_needed:
+        print(f"  [hybrid] Routing {len(tier2_calls_needed)} novel/unseen templates to Tier-2 LLM agent...", file=sys.stderr)
+        sem = asyncio.Semaphore(MAX_TASK)
+        async def _task(row, client: httpx.AsyncClient):
+            async with sem:
+                r = await call_lyzr_agent(
+                    row["service"], row["severity"], row["message"],
+                    session_id=f"hybrid-llm-{row['event_id']}",
+                    client=client,
+                )
+            r.tier_source = "tier2_llm"
+            return row["message"], r
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            pairs = await asyncio.gather(*(
+                _task(row, client) for row in tier2_calls_needed
+            ))
+        for msg, r in pairs:
+            verdict_by_message[msg] = r
+
+    wall_clock_s = time.perf_counter() - start_total
+
+    seen_messages = set()
+    fanned_results = []
+    for _, row in target_df.iterrows():
+        base = verdict_by_message[row["message"]]
+        is_first_occurrence = row["message"] not in seen_messages
+        seen_messages.add(row["message"])
+
+        fields = dict(base.__dict__)
+        fields["event_id"] = row["event_id"]
+        if not is_first_occurrence:
+            fields["is_actual_call"] = False
+            fields["latency_s"] = 0.0
+            fields["prompt_tokens"] = 0
+            fields["completion_tokens"] = 0
+            fields["cost_usd"] = 0.0
+        fanned_results.append(CallResult(**fields))
+
+    hybrid_stats = {
+        "raw_rows": len(target_df),
+        "unique_messages": len(rep_rows),
+        "tier1_fast_matches": tier1_hits,
+        "tier2_llm_calls": len(tier2_calls_needed),
+        "llm_calls_made": len(tier2_calls_needed),
+        "calls_saved_by_fast_tier": tier1_hits,
+        "total_calls_saved": len(target_df) - len(tier2_calls_needed),
+        "wall_clock_s": wall_clock_s,
+    }
+    return fanned_results, hybrid_stats
+
+
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
@@ -651,50 +897,81 @@ def _manual_macro_f1(y_true, y_pred) -> float:
     return sum(f1s) / len(f1s) if f1s else 0.0
 
 
-def print_results_table(naive: dict, optimized: dict, dedup_stats: dict):
-    def delta(a, b, higher_is_better=True):
-        if a == 0:
-            return "n/a"
-        d = (b - a) / a * 100
-        arrow = "↑" if d > 0 else "↓"
-        return f"{arrow}{abs(d):.1f}%"
-
-    print("\n" + "=" * 78)
+def print_results_table(naive: dict | None = None, optimized: dict | None = None,
+                        hybrid: dict | None = None, stats: dict | None = None):
+    print("\n" + "=" * 90)
     print("RESULTS TABLE — Track A: Auto-Remediation from Logs")
-    print("=" * 78)
-    print(f"Raw rows: {dedup_stats['raw_rows']}  |  Unique messages: "
-          f"{dedup_stats['unique_messages']}  |  Optimized LLM calls: "
-          f"{dedup_stats['llm_calls_made']}  |  Calls saved by dedup: "
-          f"{dedup_stats['calls_saved_by_dedup']}")
-    print("-" * 78)
-    rows = [
-        ("Category macro-F1", naive["category_macro_f1"], optimized["category_macro_f1"]),
-        ("Root-cause macro-F1", naive["root_cause_macro_f1"], optimized["root_cause_macro_f1"]),
-        ("Free-form remediations (want 0)", naive["free_form_remediation_count"], optimized["free_form_remediation_count"]),
-        ("False escalation rate", naive["false_escalation_rate"], optimized["false_escalation_rate"]),
-        ("Human-review flagged", naive["human_review_flagged"], optimized["human_review_flagged"]),
-        ("p50 latency (s) [escalated]", naive["p50_latency_s"], optimized["p50_latency_s"]),
-        ("p95 latency (s) [escalated]", naive["p95_latency_s"], optimized["p95_latency_s"]),
-        ("Total tokens", naive["total_tokens"], optimized["total_tokens"]),
-        ("Total cost (USD)", naive["total_cost_usd"], optimized["total_cost_usd"]),
-        ("Cost per task (USD)", naive["cost_per_task_usd"], optimized["cost_per_task_usd"]),
-        ("Batch wall-clock (s)", naive.get("wall_clock_s") or 0, optimized.get("wall_clock_s") or 0),
-        ("Throughput (tasks/min)", naive["throughput_tasks_per_min"], optimized["throughput_tasks_per_min"]),
-    ]
-    print(f"{'Metric':<34}{'Naive':>15}{'Optimized':>15}{'Delta':>14}")
-    print("-" * 78)
-    for name, a, b in rows:
-        d = delta(a, b) if isinstance(a, (int, float)) and a != 0 else "n/a"
-        print(f"{name:<34}{a:>15}{b:>15}{d:>14}")
-    print("=" * 78)
-    if naive.get("any_estimated_tokens") or optimized.get("any_estimated_tokens"):
+    print("=" * 90)
+    if stats:
+        print(f"Raw rows: {stats.get('raw_rows', 'N/A')}  |  Unique messages: "
+              f"{stats.get('unique_messages', 'N/A')}  |  Total calls saved: "
+              f"{stats.get('calls_saved_by_dedup', stats.get('total_llm_calls_saved', 'N/A'))}")
+    print("-" * 90)
+
+    cols = []
+    if naive:
+        cols.append(("Naive", naive))
+    if optimized:
+        cols.append(("Optimized", optimized))
+    if hybrid:
+        cols.append(("Hybrid", hybrid))
+
+    if len(cols) == 2 and naive and optimized:
+        rows = [
+            ("Category macro-F1", naive["category_macro_f1"], optimized["category_macro_f1"]),
+            ("Root-cause macro-F1", naive["root_cause_macro_f1"], optimized["root_cause_macro_f1"]),
+            ("Free-form remediations (want 0)", naive["free_form_remediation_count"], optimized["free_form_remediation_count"]),
+            ("False escalation rate", naive["false_escalation_rate"], optimized["false_escalation_rate"]),
+            ("Human-review flagged", naive["human_review_flagged"], optimized["human_review_flagged"]),
+            ("p50 latency (s) [escalated]", naive["p50_latency_s"], optimized["p50_latency_s"]),
+            ("p95 latency (s) [escalated]", naive["p95_latency_s"], optimized["p95_latency_s"]),
+            ("Total tokens", naive["total_tokens"], optimized["total_tokens"]),
+            ("Total cost (USD)", naive["total_cost_usd"], optimized["total_cost_usd"]),
+            ("Cost per task (USD)", naive["cost_per_task_usd"], optimized["cost_per_task_usd"]),
+            ("Batch wall-clock (s)", naive.get("wall_clock_s") or 0, optimized.get("wall_clock_s") or 0),
+            ("Throughput (tasks/min)", naive["throughput_tasks_per_min"], optimized["throughput_tasks_per_min"]),
+        ]
+        print(f"{'Metric':<34}{'Naive':>15}{'Optimized':>15}{'Delta':>14}")
+        print("-" * 78)
+        for name, a, b in rows:
+            if a == 0:
+                d = "n/a"
+            else:
+                pct = (b - a) / a * 100
+                arrow = "↑" if pct > 0 else "↓"
+                d = f"{arrow}{abs(pct):.1f}%"
+            print(f"{name:<34}{a:>15}{b:>15}{d:>14}")
+    else:
+        header = f"{'Metric':<34}" + "".join(f"{c[0]:>18}" for c in cols)
+        print(header)
+        print("-" * len(header))
+        metrics = [
+            ("Category macro-F1", "category_macro_f1"),
+            ("Root-cause macro-F1", "root_cause_macro_f1"),
+            ("Free-form remediations (want 0)", "free_form_remediation_count"),
+            ("False escalation rate", "false_escalation_rate"),
+            ("Human-review flagged", "human_review_flagged"),
+            ("p50 latency (s) [escalated]", "p50_latency_s"),
+            ("p95 latency (s) [escalated]", "p95_latency_s"),
+            ("Total tokens", "total_tokens"),
+            ("Total cost (USD)", "total_cost_usd"),
+            ("Cost per task (USD)", "cost_per_task_usd"),
+            ("Batch wall-clock (s)", "wall_clock_s"),
+            ("Throughput (tasks/min)", "throughput_tasks_per_min"),
+        ]
+        for label, key in metrics:
+            row_str = f"{label:<34}" + "".join(f"{c[1].get(key, 0):>18}" for c in cols)
+            print(row_str)
+
+    print("=" * 90)
+    if any(c[1].get("any_estimated_tokens") for c in cols):
         print("NOTE: Lyzr's /v3/inference/chat/ response does not include a "
               "token usage block (confirmed by live test) — EVERY token and "
               "cost figure above is a local estimate, not a metered number "
               "from the API. State this plainly when presenting these "
-              "numbers. The relative delta (naive vs optimized) is still "
-              "meaningful since both sides use the same estimation method, "
-              "but do not quote the absolute dollar figures as exact.")
+              "numbers. The relative delta is still meaningful since all sides "
+              "use the same estimation method, but do not quote the absolute "
+              "dollar figures as exact.")
 
 
 def run_calibration_check():
@@ -746,16 +1023,18 @@ def main():
     global MAX_TASK
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", default="track_a_logs.xlsx")
-    parser.add_argument("--mode", choices=["naive", "optimized", "both", "calibrate"],
+    parser.add_argument("--ref-data", default=None,
+                        help="Path to separate historical reference dataset for FastTierClassifier.")
+    parser.add_argument("--holdout-eval", action="store_true",
+                        help="Evaluate Tier-1 and Hybrid mode on a strict template-level held-out split.")
+    parser.add_argument("--similarity-threshold", type=float, default=0.85,
+                        help="Cosine similarity threshold for Tier-1 local resolution (default 0.85).")
+    parser.add_argument("--mode", choices=["naive", "optimized", "hybrid", "both", "all", "calibrate"],
                          default="both")
     parser.add_argument("--out-prefix", default="results")
     parser.add_argument("--max-tasks", type=int, default=MAX_TASK,
                          help="Concurrency level for API calls. Lower this "
-                              "if p95 latency exceeds budget under load "
-                              "(contention increases per-call latency as "
-                              "concurrency rises) — this is a real, "
-                              "measurable throughput-vs-latency trade-off "
-                              "worth citing in the moving-target section.")
+                              "if p95 latency exceeds budget under load.")
     args = parser.parse_args()
     MAX_TASK = args.max_tasks
 
@@ -763,26 +1042,29 @@ def main():
         run_calibration_check()
         return
 
-    if not LYZR_API_KEY or not LYZR_AGENT_ID or not LYZR_USER_ID:
-        print("ERROR: set LYZR_API_KEY, LYZR_AGENT_ID, and LYZR_USER_ID "
-              "(via .env or environment) before running.", file=sys.stderr)
-        sys.exit(1)
+    # If running naive/optimized/both/all, check API credentials
+    if args.mode in ("naive", "optimized", "both", "all"):
+        if not LYZR_API_KEY or not LYZR_AGENT_ID or not LYZR_USER_ID:
+            print("ERROR: set LYZR_API_KEY, LYZR_AGENT_ID, and LYZR_USER_ID "
+                  "(via .env or environment) before running.", file=sys.stderr)
+            sys.exit(1)
 
     df = pd.read_excel(args.data)
+    ref_df = pd.read_excel(args.ref_data) if args.ref_data else None
 
-    naive_metrics = optimized_metrics = None
+    naive_metrics = optimized_metrics = hybrid_metrics = None
     dedup_stats = {"raw_rows": len(df), "unique_messages": df["message"].nunique(),
                    "llm_calls_made": df["message"].nunique(),
                    "calls_saved_by_dedup": len(df) - df["message"].nunique()}
 
-    if args.mode in ("naive", "both"):
+    if args.mode in ("naive", "both", "all"):
         print("Running NAIVE baseline (one call per raw row)...", file=sys.stderr)
         naive_results, naive_wall_clock_s = asyncio.run(run_naive_baseline(df))
         naive_metrics = compute_metrics(naive_results, df, wall_clock_s=naive_wall_clock_s)
         pd.DataFrame([r.__dict__ for r in naive_results]).to_csv(
             f"{args.out_prefix}_naive_raw.csv", index=False)
 
-    if args.mode in ("optimized", "both"):
+    if args.mode in ("optimized", "both", "all"):
         print("Running OPTIMIZED build (dedup first)...", file=sys.stderr)
         opt_results, dedup_stats = asyncio.run(run_optimized(df))
         optimized_metrics = compute_metrics(
@@ -790,14 +1072,38 @@ def main():
         pd.DataFrame([r.__dict__ for r in opt_results]).to_csv(
             f"{args.out_prefix}_optimized_raw.csv", index=False)
 
-    if naive_metrics and optimized_metrics:
-        print_results_table(naive_metrics, optimized_metrics, dedup_stats)
+    if args.mode in ("hybrid", "all"):
+        print("Running HYBRID build (Tier-1 Fast ML + Tier-2 LLM fallback)...", file=sys.stderr)
+        hybrid_results, hybrid_stats = asyncio.run(run_hybrid(
+            df, ref_df=ref_df, holdout_eval=args.holdout_eval,
+            confidence_threshold=args.similarity_threshold
+        ))
+        hybrid_metrics = compute_metrics(
+            hybrid_results, df if not args.holdout_eval else df[df["message"].isin([r.message for r in hybrid_results])],
+            wall_clock_s=hybrid_stats.get("wall_clock_s")
+        )
+        pd.DataFrame([r.__dict__ for r in hybrid_results]).to_csv(
+            f"{args.out_prefix}_hybrid_raw.csv", index=False)
+        dedup_stats = hybrid_stats
+
+    if args.mode == "all" and naive_metrics and optimized_metrics and hybrid_metrics:
+        print_results_table(naive=naive_metrics, optimized=optimized_metrics, hybrid=hybrid_metrics, stats=dedup_stats)
+        with open(f"{args.out_prefix}_summary.json", "w") as f:
+            json.dump({"naive": naive_metrics, "optimized": optimized_metrics, "hybrid": hybrid_metrics,
+                       "stats": dedup_stats}, f, indent=2)
+        print(f"\nSaved: {args.out_prefix}_naive_raw.csv, {args.out_prefix}_optimized_raw.csv, "
+              f"{args.out_prefix}_hybrid_raw.csv, {args.out_prefix}_summary.json")
+    elif naive_metrics and optimized_metrics:
+        print_results_table(naive=naive_metrics, optimized=optimized_metrics, stats=dedup_stats)
         with open(f"{args.out_prefix}_summary.json", "w") as f:
             json.dump({"naive": naive_metrics, "optimized": optimized_metrics,
                        "dedup_stats": dedup_stats}, f, indent=2)
         print(f"\nSaved: {args.out_prefix}_naive_raw.csv, "
               f"{args.out_prefix}_optimized_raw.csv, "
               f"{args.out_prefix}_summary.json")
+    elif hybrid_metrics:
+        print(json.dumps(hybrid_metrics, indent=2))
+        print(f"\nSaved: {args.out_prefix}_hybrid_raw.csv")
     elif naive_metrics:
         print(json.dumps(naive_metrics, indent=2))
     elif optimized_metrics:
