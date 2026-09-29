@@ -10,7 +10,7 @@ Runs TWO passes over track_a_logs.xlsx and prints a results table:
 Usage:
     Put LYZR_API_KEY / LYZR_AGENT_ID / LYZR_USER_ID in a .env file, or
     export them directly.
-    python harness.py --data track_a_logs.xlsx --mode both
+    python track_a/harness.py --mode both  (from repo root, or run inside track_a/)
 
 Design notes (read before you run this against real money):
   - This script does NOT hardcode which messages are noise. That would be
@@ -47,26 +47,24 @@ import argparse
 import asyncio
 import json
 import os
-import re
 import time
 import statistics
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
 
-from dotenv import load_dotenv
 import httpx
+import numpy as np
 import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common import lyzr_client as lyzr  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Config — edit these or pass as env vars / CLI args
 # ---------------------------------------------------------------------------
 
-load_dotenv()
-
-LYZR_BASE_URL = os.environ.get("LYZR_BASE_URL", "https://agent-prod.studio.lyzr.ai")
-LYZR_API_KEY = os.environ.get("LYZR_API_KEY", "")
 LYZR_AGENT_ID = os.environ.get("LYZR_AGENT_ID", "")
-LYZR_USER_ID = os.environ.get("LYZR_USER_ID", "")  # required by /v3/inference/chat/
 
 CONFIDENCE_THRESHOLD = 0.6  # below this -> flagged for human review
 
@@ -86,31 +84,9 @@ CONFIDENCE_THRESHOLD = 0.6  # below this -> flagged for human review
 # The PREVIOUS constant here (3843) was not measured this way — it
 # overestimated the real fixed overhead by ~450 tokens/call.
 PROMPT_OVERHEAD_TOKENS = 3397
-
-# Pricing calibrated from the SAME 16 real traces above (each trace
-# carries llm_input_tokens, llm_output_tokens, and action_cost in
-# credits). Least-squares fit of credits = a*input + b*output across all
-# 16 points (numpy.linalg.lstsq, no intercept): fits to within 0.08% max
-# error on every point, so this is a well-determined system, not a
-# 2-point guess.
-#
-# The PREVIOUS constants here (0.0000029 / 0.0000165) were 36-52x too
-# LOW relative to these 16 real traces — meaning every dollar figure
-# computed with them (including anything already reported in
-# README.md / OPTIMIZATION_WRITEUP.md / SCOPING_MEMO.md) understated
-# real cost by roughly 45x. The previous comment block attributed those
-# small constants to "2 real gpt-5-mini traces," but the deployed agent
-# in payload.json runs gpt-4o-mini — that mismatch is itself a sign the
-# prior calibration wasn't actually run against this agent. Re-run
-# `--mode calibrate` (or repeat this trace-matching process) if
-# payload.json's agent_instructions or model changes again.
-CREDITS_PER_INPUT_TOKEN = 0.00015006
-CREDITS_PER_OUTPUT_TOKEN = 0.00059287
-# Lyzr's published self-serve rate is ~$10 per 1,000 credits. Not
-# independently confirmed against this specific account's exact billing
-# tier -- check the account's billing page before quoting exact dollar
-# figures as final.
-USD_PER_CREDIT = 0.01
+# Per-token pricing (calibrated from the same 16 traces) lives in
+# common/lyzr_client.py. Re-run `--mode calibrate` if payload.json's
+# instructions or model change.
 
 ALLOWED_CATEGORIES = {
     "capacity", "dependency_failure", "resource_exhaustion",
@@ -168,9 +144,6 @@ ROOT_CAUSE_TO_REMEDIATION = {
     "memory_leak": "restart_pod_and_raise_heap_limit",
     "expired_cert": "rotate_certificate_and_add_expiry_alert",
 }
-
-import numpy as np
-
 
 class FastTierClassifier:
     """
@@ -260,19 +233,6 @@ class FastTierClassifier:
         return None, None, None, None, best_sim, False
 
 
-try:
-    import tiktoken
-    _ENC = tiktoken.get_encoding("cl100k_base")
-    def _estimate_tokens(text: str) -> int:
-        return len(_ENC.encode(text))
-except ImportError:
-    def _estimate_tokens(text: str) -> int:
-        # crude fallback: ~1.3 tokens per word, good enough for a rough
-        # estimate flag — real accounting should come from the API's
-        # own usage block whenever available.
-        return int(len(text.split()) * 1.3)
-
-
 @dataclass
 class CallResult:
     event_id: str
@@ -307,95 +267,35 @@ class CallResult:
 async def call_lyzr_agent(service: str, severity: str, message: str,
                            session_id: str, client: httpx.AsyncClient,
                            retries: int = 3) -> CallResult:
-    """
-    Async version: calls the Lyzr inference endpoint for a single log line,
-    with retries on transient failure. Uses a shared httpx.AsyncClient for
-    connection-pool reuse across concurrent calls — one client per batch run,
-    not one per call. Idempotent: session_id is deterministic per event so a
-    retried call doesn't create duplicate state on Lyzr's side.
-
-    asyncio vs threads: this is an I/O-bound workload (~7s/call in network
-    wait). asyncio coroutines are cheaper than OS threads at high concurrency
-    — no kernel context-switch overhead, no per-thread stack allocation, no
-    threading.Lock on shared state. The bottleneck at production scale is the
-    provider's RPM quota, not the client's concurrency mechanism — but asyncio
-    is the architecturally correct choice once you want hundreds of concurrent
-    in-flight calls without thread overhead.
-    """
+    """Classify one log line with the Track A agent. One shared
+    httpx.AsyncClient per batch for connection reuse. asyncio over threads:
+    the workload is I/O-bound, and the real ceiling at scale is the
+    provider's RPM quota, not client concurrency."""
     result = CallResult(event_id=session_id, message=message)
+    user_message = f"service={service} severity={severity} message=\"{message}\""
 
-    user_message = (
-        f"service={service} severity={severity} message=\"{message}\""
-    )
+    try:
+        resp = await lyzr.chat(client, LYZR_AGENT_ID, session_id, user_message,
+                               PROMPT_OVERHEAD_TOKENS, retries)
+    except lyzr.LyzrCallError as e:
+        result.error = str(e)
+        result.needs_human_review = True
+        result.schema_valid = False
+        return result
 
-    payload = {
-        "user_id": LYZR_USER_ID,
-        "agent_id": LYZR_AGENT_ID,
-        "session_id": session_id,
-        "message": user_message,
-    }
-    headers = {
-        "x-api-key": LYZR_API_KEY,
-        "Content-Type": "application/json",
-    }
+    result.latency_s = resp.latency_s
+    result.prompt_tokens = resp.prompt_tokens
+    result.completion_tokens = resp.completion_tokens
+    result.tokens_estimated = resp.tokens_estimated
+    result.cost_usd = resp.cost_usd
 
-    last_err = None
-    for attempt in range(retries):
-        start = time.perf_counter()
-        try:
-            resp = await client.post(
-                f"{LYZR_BASE_URL}/v3/inference/chat/",
-                headers=headers,
-                json=payload,
-            )
-            elapsed = time.perf_counter() - start
-            resp.raise_for_status()
-            data = resp.json()
-            result.latency_s = elapsed
-
-            raw_text = data.get("response") or data.get("agent_response") or ""
-
-            # Confirmed via live testing: Lyzr's /v3/inference/chat/
-            # response is {"response": "...", "module_outputs": {}} —
-            # no token usage block. So this is ALWAYS an estimate, not
-            # a fallback for a rare missing case. We still check for a
-            # usage block in case a future API version or a different
-            # account tier adds one, but assume it won't be there.
-            usage = data.get("usage") or {}
-            if usage:
-                result.prompt_tokens = usage.get("prompt_tokens", 0)
-                result.completion_tokens = usage.get("completion_tokens", 0)
-            else:
-                result.prompt_tokens = _estimate_tokens(user_message) + PROMPT_OVERHEAD_TOKENS
-                result.completion_tokens = _estimate_tokens(str(raw_text))
-                result.tokens_estimated = True
-
-            result.cost_usd = (
-                result.prompt_tokens * CREDITS_PER_INPUT_TOKEN
-                + result.completion_tokens * CREDITS_PER_OUTPUT_TOKEN
-            ) * USD_PER_CREDIT
-
-            try:
-                _parse_verdict(raw_text, result, severity)
-            except Exception as parse_err:  # noqa: BLE001 - a parsing bug is
-                # not a transient network fault; don't let it consume the
-                # retry budget or get logged as "failed after N attempts"
-                # (which would misattribute a parsing bug as a network
-                # failure). The HTTP call already succeeded at this point.
-                result.error = f"parse error (not retried): {parse_err}"
-                result.needs_human_review = True
-                result.schema_valid = False
-            return result
-
-        except Exception as e:  # noqa: BLE001 - want to retry on anything transient
-            last_err = str(e)
-            if attempt < retries - 1:
-                await asyncio.sleep(min(2 ** attempt, 8))  # non-blocking backoff
-                continue
-
-    result.error = f"failed after {retries} attempts: {last_err}"
-    result.needs_human_review = True
-    result.schema_valid = False
+    try:
+        _parse_verdict(resp.text, result, severity)
+    except Exception as parse_err:  # noqa: BLE001 - a parsing bug is not a
+        # network fault, so it is reported separately and never retried.
+        result.error = f"parse error (not retried): {parse_err}"
+        result.needs_human_review = True
+        result.schema_valid = False
     return result
 
 
@@ -407,33 +307,10 @@ def _parse_verdict(raw_text: str, result: CallResult, severity: str | None = Non
     docstring). Without schema enforcement, defensive parsing matters
     MORE, not less: the model may still wrap output in markdown fences
     or add stray prose despite being told not to."""
-    if isinstance(raw_text, str):
-        text = raw_text.strip()
-        # Try a fenced ```json ... ``` or ``` ... ``` block first.
-        fence_match = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
-        if fence_match:
-            text = fence_match.group(1)
-        else:
-            # Fallback: grab the outermost {...} span, in case there's
-            # stray prose before/after the JSON (e.g. "Sure, here you
-            # go:\n{...}") that a simple startswith("```") check would
-            # miss entirely.
-            brace_match = re.search(r"\{.*\}", text, re.DOTALL)
-            if brace_match:
-                text = brace_match.group(0)
-    else:
-        text = raw_text
-
     try:
-        verdict = json.loads(text) if isinstance(text, str) else text
-    except (json.JSONDecodeError, TypeError):
-        result.error = "could not parse JSON from model output"
-        result.needs_human_review = True
-        result.schema_valid = False
-        return
-
-    if not isinstance(verdict, dict):
-        result.error = "parsed JSON was not an object"
+        verdict = lyzr.parse_json_object(raw_text)
+    except ValueError as e:
+        result.error = str(e)
         result.needs_human_review = True
         result.schema_valid = False
         return
@@ -837,7 +714,7 @@ def compute_metrics(results: list[CallResult], df: pd.DataFrame,
     n_calls = len(actual_calls)
 
     p50 = statistics.median(latencies) if latencies else 0.0
-    p95 = _percentile(latencies, 95) if latencies else 0.0
+    p95 = lyzr.percentile(latencies, 95)
 
     total_cost = sum(r.cost_usd for r in actual_calls)
     total_tokens = sum(r.prompt_tokens + r.completion_tokens for r in actual_calls)
@@ -870,17 +747,6 @@ def compute_metrics(results: list[CallResult], df: pd.DataFrame,
         "throughput_tasks_per_min": throughput,
         "any_estimated_tokens": any(r.tokens_estimated for r in results),
     }
-
-
-def _percentile(data: list[float], pct: float) -> float:
-    if not data:
-        return 0.0
-    s = sorted(data)
-    k = (len(s) - 1) * (pct / 100)
-    f, c = int(k), min(int(k) + 1, len(s) - 1)
-    if f == c:
-        return s[f]
-    return s[f] + (s[c] - s[f]) * (k - f)
 
 
 def _manual_macro_f1(y_true, y_pred) -> float:
@@ -987,8 +853,8 @@ def run_calibration_check():
     real_cost_credits_raw = input("Real action_cost in credits (optional, "
                                    "press Enter to skip): ").strip()
 
-    est_input = _estimate_tokens(message) + PROMPT_OVERHEAD_TOKENS
-    est_output = _estimate_tokens("")
+    est_input = lyzr.estimate_tokens(message) + PROMPT_OVERHEAD_TOKENS
+    est_output = lyzr.estimate_tokens("")
 
     input_delta_pct = (est_input - real_input) / real_input * 100 if real_input else 0
 
@@ -999,11 +865,8 @@ def run_calibration_check():
 
     if real_cost_credits_raw:
         real_cost_credits = float(real_cost_credits_raw)
-        real_cost_usd = real_cost_credits * USD_PER_CREDIT
-        est_cost_usd = (
-            est_input * CREDITS_PER_INPUT_TOKEN
-            + est_output * CREDITS_PER_OUTPUT_TOKEN
-        ) * USD_PER_CREDIT
+        real_cost_usd = real_cost_credits * lyzr.USD_PER_CREDIT
+        est_cost_usd = lyzr.estimate_cost_usd(est_input, est_output)
         print(f"{'Cost (USD, calibrated)':<28}{est_cost_usd:>12.5f}{real_cost_usd:>12.5f}")
         print("\nNOTE: cost uses the CREDITS_PER_INPUT/OUTPUT_TOKEN rates "
               "calibrated from earlier real traces. If PROMPT_OVERHEAD_TOKENS "
@@ -1022,7 +885,7 @@ def run_calibration_check():
 def main():
     global MAX_TASK
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", default="track_a_logs.xlsx")
+    parser.add_argument("--data", default=str(Path(__file__).parent / "track_a_logs.xlsx"))
     parser.add_argument("--ref-data", default=None,
                         help="Path to separate historical reference dataset for FastTierClassifier.")
     parser.add_argument("--holdout-eval", action="store_true",
@@ -1031,7 +894,8 @@ def main():
                         help="Cosine similarity threshold for Tier-1 local resolution (default 0.85).")
     parser.add_argument("--mode", choices=["naive", "optimized", "hybrid", "both", "all", "calibrate"],
                          default="both")
-    parser.add_argument("--out-prefix", default="results")
+    parser.add_argument("--out-dir", default=str(Path(__file__).parent / "results"))
+    parser.add_argument("--out-prefix", default="run")
     parser.add_argument("--max-tasks", type=int, default=MAX_TASK,
                          help="Concurrency level for API calls. Lower this "
                               "if p95 latency exceeds budget under load.")
@@ -1043,8 +907,11 @@ def main():
         return
 
     # If running naive/optimized/both/all, check API credentials
-    if args.mode in ("naive", "optimized", "both", "all"):
-        if not LYZR_API_KEY or not LYZR_AGENT_ID or not LYZR_USER_ID:
+    Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+    args.out_prefix = str(Path(args.out_dir) / args.out_prefix)
+
+    if args.mode in ("naive", "optimized", "hybrid", "both", "all"):
+        if not lyzr.LYZR_API_KEY or not LYZR_AGENT_ID or not lyzr.LYZR_USER_ID:
             print("ERROR: set LYZR_API_KEY, LYZR_AGENT_ID, and LYZR_USER_ID "
                   "(via .env or environment) before running.", file=sys.stderr)
             sys.exit(1)

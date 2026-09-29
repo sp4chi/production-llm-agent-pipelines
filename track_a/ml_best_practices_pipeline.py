@@ -9,6 +9,8 @@ following strict ML Best Practices:
 """
 
 import sys
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import GroupKFold
@@ -20,7 +22,7 @@ from sklearn.metrics import classification_report, f1_score, precision_score, re
 from sklearn.pipeline import Pipeline
 
 
-def run_ml_best_practices_benchmark(data_path="track_a_logs.xlsx"):
+def run_ml_best_practices_benchmark(data_path=Path(__file__).parent / "track_a_logs.xlsx"):
     print("=" * 85)
     print(" MACHINE LEARNING BEST PRACTICES: TEMPLATE-LEVEL SRE LOG BENCHMARK")
     print("=" * 85)

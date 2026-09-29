@@ -1,11 +1,12 @@
 .env
 *.mypy_cache
+.pytest_cache
 venv
-Lyzr*
+/Lyzr_Assignment.docx
 
-results_op*
+results/
+results_*
 
 harness-old*
 clean.py
-results*
 __pycache__
